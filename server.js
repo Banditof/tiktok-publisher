@@ -339,8 +339,20 @@ async function downloadImage(prompt, outputPath, style) {
   const seed       = Math.floor(Math.random() * 99999);
   const url        = `https://image.pollinations.ai/prompt/${encoded}?width=1080&height=1920&seed=${seed}&nologo=true&enhance=true`;
 
-  const res = await fetch(url, { timeout: 30000 });
-  if (!res.ok) throw new Error(`Pollinations HTTP ${res.status}`);
+  // Essayer 2 fois avec des seeds différents
+  let res;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const seedRetry = Math.floor(Math.random() * 99999);
+      const urlRetry  = attempt === 0 ? url : url.replace(/seed=\d+/, `seed=${seedRetry}`);
+      res = await fetch(urlRetry, { timeout: 25000 });
+      if (res.ok) break;
+    } catch(fetchErr) {
+      if (attempt === 1) throw fetchErr;
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+  if (!res || !res.ok) throw new Error(`Pollinations HTTP ${res?.status || 'timeout'}`);
   const buf = await res.buffer();
   fs.writeFileSync(outputPath, buf);
   return outputPath;
@@ -391,35 +403,70 @@ function getAudioDuration(audioPath) {
   });
 }
 
+// Échapper le texte pour FFmpeg drawtext (supprimer tous les caractères spéciaux)
+function sanitizeDrawtext(texte) {
+  return (texte || '')
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')  // Supprimer les accents
+    .replace(/[^a-zA-Z0-9 .,!?]/g, ' ')                  // Garder uniquement alphanum + ponctuation simple
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+}
+
+// Couper un texte en lignes de N caractères max
+function couperLignes(texte, maxChars = 28) {
+  const mots = texte.split(' ').filter(Boolean);
+  const lignes = [];
+  let ligne = '';
+  mots.forEach(m => {
+    if ((ligne + (ligne?' ':'') + m).length > maxChars) {
+      if (ligne) lignes.push(ligne);
+      ligne = m.slice(0, maxChars);
+    } else {
+      ligne = (ligne ? ligne + ' ' : '') + m;
+    }
+  });
+  if (ligne) lignes.push(ligne);
+  return lignes.slice(0, 3).join('\n'); // Max 3 lignes
+}
+
 // Créer un segment vidéo (image + durée + sous-titre)
 function creerSegmentVideo(imagePath, duration, texte, outputPath, couleur = 'white') {
   return new Promise((resolve, reject) => {
-    // Échapper le texte pour FFmpeg drawtext
-    const texteEsc = texte.replace(/[':]/g, '\\$&').replace(/\n/g, ' ').slice(0, 100);
-    const wordWrap = 30;
-    // Couper le texte en lignes
-    const mots  = texteEsc.split(' ');
-    const lignes = [];
-    let   ligne  = '';
-    mots.forEach(m => {
-      if ((ligne + ' ' + m).length > wordWrap) { lignes.push(ligne); ligne = m; }
-      else ligne = (ligne ? ligne + ' ' : '') + m;
-    });
-    if (ligne) lignes.push(ligne);
-    const texteMultiligne = lignes.join('\n');
+    const textSafe = sanitizeDrawtext(texte);
+    const textML   = couperLignes(textSafe);
+    const fontColor = couleur === 'yellow' ? 'yellow' : 'white';
 
-    const cmd = ffmpeg(imagePath)
+    // Si pas de texte, créer le segment sans drawtext
+    const filters = [
+      'scale=1080:1920:force_original_aspect_ratio=increase',
+      'crop=1080:1920',
+    ];
+    if (textML.trim()) {
+      filters.push(
+        `drawtext=text='${textML}':fontsize=54:fontcolor=${fontColor}:borderw=4:bordercolor=black@0.8:x=(w-text_w)/2:y=h-320:line_spacing=12:font=DejaVu-Sans-Bold`
+      );
+    }
+
+    ffmpeg(imagePath)
       .inputOptions(['-loop 1', `-t ${duration}`])
-      .videoFilters([
-        'scale=1080:1920:force_original_aspect_ratio=increase',
-        'crop=1080:1920',
-        `drawtext=text='${texteMultiligne}':fontsize=52:fontcolor=${couleur}:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h-300:line_spacing=10`,
-      ])
+      .videoFilters(filters)
       .outputOptions(['-c:v libx264', '-preset ultrafast', '-pix_fmt yuv420p', `-t ${duration}`, '-r 30'])
       .output(outputPath)
       .on('end', resolve)
-      .on('error', reject);
-    cmd.run();
+      .on('error', (err) => {
+        // Si drawtext échoue, retry SANS texte
+        console.warn('[Montage] drawtext échoué, retry sans texte:', err.message.slice(0,80));
+        ffmpeg(imagePath)
+          .inputOptions(['-loop 1', `-t ${duration}`])
+          .videoFilters(['scale=1080:1920:force_original_aspect_ratio=increase','crop=1080:1920'])
+          .outputOptions(['-c:v libx264', '-preset ultrafast', '-pix_fmt yuv420p', `-t ${duration}`, '-r 30'])
+          .output(outputPath)
+          .on('end', resolve)
+          .on('error', reject)
+          .run();
+      })
+      .run();
   });
 }
 
@@ -526,8 +573,20 @@ async function runMontage() {
       STATE.publishQueue[outFile] = {
         titre: script.titre, caption: [script.accroche, script.corps, script.cta].filter(Boolean).join(' ').slice(0, 300),
         hashtags: script.hashtags || [], filePath: outPath, fileSize: stat.size,
-        scheduledAt, status: 'scheduled', addedAt: new Date().toISOString(), error: null,
+        scheduledAt, status: 'pending_approval',  // Attente validation humaine (ou auto après 2h)
+        addedAt: new Date().toISOString(), error: null,
+        autoApproveAt: new Date(Date.now() + 2 * 3600 * 1000).toISOString(), // Auto-approuvé dans 2h
       };
+
+      // Timer auto-approbation dans 2h si pas de réponse humaine
+      setTimeout(() => {
+        const v = STATE.publishQueue[outFile];
+        if (v && v.status === 'pending_approval') {
+          v.status = 'scheduled';
+          log('montage', `Auto-approuvé: "${v.titre}" (aucune intervention en 2h)`, 'info');
+          msg('montage', 'pub', 'video_approved', { titre: v.titre, auto: true }, 'normal');
+        }
+      }, 2 * 3600 * 1000);
 
       msg('montage', 'pub', 'video_ready', { titre: script.titre, videoFile: outFile, scheduledAt }, 'high');
       msg('montage', 'all', 'video_created', { titre: script.titre, size: formatBytes(stat.size), scheduledAt }, 'normal');
@@ -543,17 +602,43 @@ async function runMontage() {
   setAgent('montage', 'idle', { lastRun: new Date().toISOString() });
 }
 
-// Image de fallback (fond dégradé sombre)
+// Image de fallback — dégradé coloré selon le style
 async function creerImageFallback(outputPath, style) {
-  return new Promise((resolve, reject) => {
-    const color1 = style === 'mystere' ? 'color=0x050510' : 'color=0x0a0a1a';
+  return new Promise((resolve) => {
+    const gradients = {
+      mystere:    'color=c=0x0a0510:size=1080x1920,geq=r='10+5*sin(X/100)':g='5+3*sin(Y/150)':b='25+15*sin((X+Y)/200)'',
+      dynamique:  'color=c=0x100a05:size=1080x1920,geq=r='20+10*sin(X/80)':g='10+5*sin(Y/100)':b='5'',
+      cinematique:'color=c=0x050a15:size=1080x1920,geq=r='5':g='10+5*sin(X/120)':b='25+15*sin(Y/180)'',
+    };
+    const filter = gradients[style] || gradients.cinematique;
     ffmpeg()
-      .input(`${color1}:size=1080x1920:rate=1`)
+      .input(filter.split(',')[0])
       .inputOptions(['-f lavfi'])
-      .outputOptions(['-t 1', '-frames:v 1'])
+      .outputOptions(['-t 1', '-frames:v 1', '-vf', filter.split(',')[1] || 'null'])
       .output(outputPath)
       .on('end', resolve)
-      .on('error', () => { fs.writeFileSync(outputPath, Buffer.alloc(100)); resolve(); })
+      .on('error', () => {
+        // Fallback ultime : créer une image JPEG noire via Buffer
+        try {
+          // Petit JPEG noir 1x1 pixel répété
+          const jpegBlack = Buffer.from([
+            0xFF,0xD8,0xFF,0xE0,0x00,0x10,0x4A,0x46,0x49,0x46,0x00,0x01,0x01,0x00,0x00,0x01,
+            0x00,0x01,0x00,0x00,0xFF,0xDB,0x00,0x43,0x00,0x08,0x06,0x06,0x07,0x06,0x05,0x08,
+            0x07,0x07,0x07,0x09,0x09,0x08,0x0A,0x0C,0x14,0x0D,0x0C,0x0B,0x0B,0x0C,0x19,0x12,
+            0x13,0x0F,0x14,0x1D,0x1A,0x1F,0x1E,0x1D,0x1A,0x1C,0x1C,0x20,0x24,0x2E,0x27,0x20,
+            0x22,0x2C,0x23,0x1C,0x1C,0x28,0x37,0x29,0x2C,0x30,0x31,0x34,0x34,0x34,0x1F,0x27,
+            0x39,0x3D,0x38,0x32,0x3C,0x2E,0x33,0x34,0x32,0xFF,0xC0,0x00,0x0B,0x08,0x00,0x01,
+            0x00,0x01,0x01,0x01,0x11,0x00,0xFF,0xC4,0x00,0x1F,0x00,0x00,0x01,0x05,0x01,0x01,
+            0x01,0x01,0x01,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x02,0x03,0x04,
+            0x05,0x06,0x07,0x08,0x09,0x0A,0x0B,0xFF,0xDA,0x00,0x08,0x01,0x01,0x00,0x00,0x3F,
+            0x00,0xF5,0x0A,0xFF,0xD9
+          ]);
+          fs.writeFileSync(outputPath, jpegBlack);
+        } catch(e2) {
+          fs.writeFileSync(outputPath, Buffer.alloc(1000, 0));
+        }
+        resolve();
+      })
       .run();
   });
 }
@@ -733,6 +818,55 @@ app.post('/run/:agent', async (req,res) => {
   else if (agent==='montage') await runMontage();
   else if (agent==='pub')     runPub();
   else if (agent==='all')     await runOrchestrator();
+});
+
+// ── Progression temps réel des agents ────────────────────────────
+app.get('/progress', (req, res) => {
+  const steps = [
+    { agent: 'analytics', label: 'Analyse TikTok',      done: (STATE.agents.analytics?.cycleCount||0) > 0 },
+    { agent: 'veille',    label: 'Stratégie niche',      done: (STATE.agents.veille?.cycleCount||0) > 0 },
+    { agent: 'contenu',   label: 'Génération scripts',   done: STATE.scripts.length > 0 },
+    { agent: 'voix',      label: 'Voix-off ElevenLabs',  done: STATE.audioFiles.length > 0 },
+    { agent: 'montage',   label: 'Montage vidéo IA',     done: STATE.videoFiles.length > 0 },
+    { agent: 'pub',       label: 'Publication TikTok',   done: Object.values(STATE.publishQueue).some(v=>v.status==='published') },
+  ];
+  const currentAgent = Object.entries(STATE.agents).find(([,a]) => a.status === 'running')?.[0] || null;
+  const currentStep  = steps.findIndex(s => s.agent === currentAgent);
+  const doneCount    = steps.filter(s=>s.done).length;
+  res.json({ steps, currentAgent, currentStep, doneCount, total: steps.length, pct: Math.round(doneCount/steps.length*100) });
+});
+
+// ── Approbation / Rejet vidéo par l'utilisateur ────────────────
+app.post('/video/:filename/approve', (req, res) => {
+  const v = STATE.publishQueue[req.params.filename];
+  if (!v) return res.status(404).json({ error: 'Vidéo introuvable' });
+  v.status = 'scheduled';
+  v.approvedAt = new Date().toISOString();
+  log('system', `✅ Vidéo approuvée manuellement: "${v.titre}"`, 'success');
+  msg('system', 'pub', 'video_approved', { titre: v.titre, manual: true }, 'high');
+  res.json({ ok: true, scheduledAt: v.scheduledAt });
+});
+
+app.post('/video/:filename/reject', async (req, res) => {
+  const v = STATE.publishQueue[req.params.filename];
+  if (!v) return res.status(404).json({ error: 'Vidéo introuvable' });
+  const titreRejete = v.titre;
+  // Supprimer la vidéo
+  try { if (fs.existsSync(v.filePath)) fs.unlinkSync(v.filePath); } catch(e) {}
+  delete STATE.publishQueue[req.params.filename];
+  STATE.videoFiles = STATE.videoFiles.filter(vf => vf.filename !== req.params.filename);
+  // Marquer le script comme rejeté pour régénération
+  const sc = STATE.scripts.find(s => s.titre === titreRejete);
+  if (sc) { sc.status = 'rejected'; sc.rejectedAt = new Date().toISOString(); }
+  log('system', `❌ Vidéo rejetée: "${titreRejete}" — régénération au prochain cycle`, 'warn');
+  msg('system', 'contenu', 'content_rejected', { titre: titreRejete, reason: req.body?.reason || 'Rejet manuel' }, 'high');
+  res.json({ ok: true });
+  // Déclencher immédiatement un nouveau cycle contenu
+  setTimeout(async () => {
+    if (sc) { sc.status = 'needs_regen'; }
+    STATE.scripts = STATE.scripts.filter(s => s.status !== 'rejected');
+    await runContenu();
+  }, 3000);
 });
 
 // ── Route streaming vidéo — pour preview depuis le dashboard ────
