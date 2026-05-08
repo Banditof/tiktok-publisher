@@ -22,6 +22,16 @@ const cron     = require('node-cron');
 const ffmpeg   = require('fluent-ffmpeg');
 const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
 ffmpeg.setFfmpegPath(ffmpegPath);
+// Configurer ffprobe (inclus dans @ffmpeg-installer)
+try {
+  const ffprobePath = ffmpegPath.replace(/ffmpeg([^/\\]*)$/, 'ffprobe$1');
+  if (require('fs').existsSync(ffprobePath)) {
+    ffmpeg.setFfprobePath(ffprobePath);
+    console.log('[FFmpeg] ffprobe configuré:', ffprobePath);
+  } else {
+    console.warn('[FFmpeg] ffprobe non trouvé — estimation durée par taille fichier');
+  }
+} catch(e) { console.warn('[FFmpeg] ffprobe config:', e.message); }
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -161,8 +171,8 @@ async function runVeille() {
   log('veille', `Analyse stratégie${doRotate ? ' [rotation niche]' : ''}`);
   try {
     const prompt = doRotate
-      ? `Niche TikTok "${STATE.strategy.niche}" engagement faible (${STATE.analytics.engRate}%). Suggère une sous-niche plus performante similaire. JSON: {"niche":"...","ton":"...","raison":"...","hashtags":["h1","h2","h3"],"visualStyle":"cinematique|mystere|dynamique"}`
-      : `Optimise la stratégie niche TikTok "${STATE.strategy.niche}". JSON: {"optimisation":"conseil","hashtags":["h1","h2","h3"],"ton":"ton optimal","visualStyle":"cinematique|mystere|dynamique"}`;
+      ? `Tu es expert TikTok France. La niche "${STATE.strategy.niche}" a un taux d'engagement de ${STATE.analytics.engRate}%, c'est trop faible. Propose une sous-niche similaire plus performante. Réponds UNIQUEMENT avec ce JSON valide, sans aucun texte avant ou après: {"niche":"nom de la nouvelle niche","ton":"Dramatique","raison":"pourquoi cette niche est meilleure","hashtags":["hashtag1","hashtag2","hashtag3"],"visualStyle":"cinematique"}`
+      : `Tu es expert TikTok France. Optimise la stratégie pour la niche "${STATE.strategy.niche}". Réponds UNIQUEMENT avec ce JSON valide, sans aucun texte avant ou après: {"optimisation":"conseil d'amelioration concret","hashtags":["hashtag1","hashtag2","hashtag3"],"ton":"Dramatique","visualStyle":"cinematique"}`;
 
     const res  = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -170,10 +180,14 @@ async function runVeille() {
       body: JSON.stringify({ model: 'claude-haiku-4-5-20251001', max_tokens: 400, messages: [{ role: 'user', content: prompt }] })
     });
     const data = await res.json();
-    let raw = (data.content||[]).map(b=>b.text||'').join('');
+    let raw = (data.content||[]).map(b=>b.text||'').join('').trim();
+    if (!raw) throw new Error('Réponse vide de Claude — réessai au prochain cycle');
     const s = raw.indexOf('{'), e = raw.lastIndexOf('}');
-    if (s !== -1 && e !== -1) raw = raw.slice(s, e+1);
-    const parsed = JSON.parse(raw);
+    if (s === -1 || e === -1) throw new Error('Pas de JSON dans la réponse: ' + raw.slice(0,100));
+    raw = raw.slice(s, e+1);
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch(jsonErr) { throw new Error('JSON invalide: ' + raw.slice(0,100)); }
 
     if (doRotate && parsed.niche) {
       const old = STATE.strategy.niche;
@@ -355,11 +369,24 @@ function preparerSegments(script, audioDurationSec) {
 }
 
 // Obtenir la durée d'un fichier audio
+// Priorité : ffprobe → estimation par taille (128kbps) → 60s par défaut
 function getAudioDuration(audioPath) {
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve) => {
     ffmpeg.ffprobe(audioPath, (err, meta) => {
-      if (err) reject(err);
-      else resolve(meta?.format?.duration || 60);
+      if (!err && meta?.format?.duration) {
+        resolve(meta.format.duration);
+      } else {
+        // Fallback : estimation par taille de fichier (ElevenLabs = ~128kbps)
+        try {
+          const sizeBytes = require('fs').statSync(audioPath).size;
+          const estimated = (sizeBytes * 8) / (128 * 1000);  // secondes
+          const duration  = Math.max(15, Math.min(120, estimated));
+          console.log(`[Montage] Durée estimée: ${Math.round(duration)}s (taille: ${Math.round(sizeBytes/1024)}Ko)`);
+          resolve(duration);
+        } catch(e2) {
+          resolve(60); // Fallback absolu
+        }
+      }
     });
   });
 }
