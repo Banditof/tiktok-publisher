@@ -735,6 +735,66 @@ app.post('/run/:agent', async (req,res) => {
   else if (agent==='all')     await runOrchestrator();
 });
 
+// ── Route streaming vidéo — pour preview depuis le dashboard ────
+app.get('/video/:filename', (req, res) => {
+  const filename = req.params.filename.replace(/\.\./g, ''); // sécurité
+  const filePath = path.join('/tmp/videos', filename);
+  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Vidéo introuvable' });
+
+  const stat = fs.statSync(filePath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  if (range) {
+    // Support du streaming range (nécessaire pour HTML5 video)
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end   = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunk = end - start + 1;
+    const stream = fs.createReadStream(filePath, { start, end });
+    res.writeHead(206, {
+      'Content-Range':  `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges':  'bytes',
+      'Content-Length': chunk,
+      'Content-Type':   'video/mp4',
+    });
+    stream.pipe(res);
+  } else {
+    res.writeHead(200, { 'Content-Length': fileSize, 'Content-Type': 'video/mp4', 'Accept-Ranges': 'bytes' });
+    fs.createReadStream(filePath).pipe(res);
+  }
+});
+
+// ── Liste des vidéos disponibles pour preview ──────────────────
+app.get('/videos/list', (req, res) => {
+  try {
+    const dir = '/tmp/videos';
+    if (!fs.existsSync(dir)) return res.json({ videos: [] });
+    const files = fs.readdirSync(dir)
+      .filter(f => f.endsWith('.mp4') || f.endsWith('.webm'))
+      .map(f => {
+        const fp  = path.join(dir, f);
+        const st  = fs.statSync(fp);
+        // Trouver le script associé
+        const sc  = STATE.scripts.find(s => s.videoFile === f);
+        const pq  = STATE.publishQueue[f];
+        return {
+          filename:    f,
+          size:        st.size,
+          createdAt:   st.birthtime,
+          titre:       sc?.titre || pq?.titre || f,
+          status:      pq?.status || 'ready',
+          scheduledAt: pq?.scheduledAt || null,
+          url:         `/video/${f}`,
+        };
+      })
+      .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    res.json({ videos: files });
+  } catch(e) {
+    res.json({ videos: [] });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`\n🤖 TikTok Agent Suite v3 — port ${PORT}`);
   console.log('   5 agents autonomes: Veille, Contenu, Voix, Montage, Publication');
