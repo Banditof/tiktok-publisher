@@ -19,19 +19,22 @@ const fetch    = require('node-fetch');
 const fs       = require('fs');
 const path     = require('path');
 const cron     = require('node-cron');
-const ffmpeg   = require('fluent-ffmpeg');
-const ffmpegPath = require('@ffmpeg-installer/ffmpeg').path;
-ffmpeg.setFfmpegPath(ffmpegPath);
-// Configurer ffprobe (inclus dans @ffmpeg-installer)
+// FFmpeg — chargement optionnel (Railway peut ne pas l'avoir)
+let ffmpeg = null;
 try {
-  const ffprobePath = ffmpegPath.replace(/ffmpeg([^/\\]*)$/, 'ffprobe$1');
-  if (require('fs').existsSync(ffprobePath)) {
-    ffmpeg.setFfprobePath(ffprobePath);
-    console.log('[FFmpeg] ffprobe configuré:', ffprobePath);
-  } else {
-    console.warn('[FFmpeg] ffprobe non trouvé — estimation durée par taille fichier');
-  }
-} catch(e) { console.warn('[FFmpeg] ffprobe config:', e.message); }
+  ffmpeg = require('fluent-ffmpeg');
+  const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+  ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+  // Tenter de configurer ffprobe
+  try {
+    const probePath = ffmpegInstaller.path.replace(/ffmpeg([^/\\]*)$/, 'ffprobe$1');
+    if (fs.existsSync(probePath)) ffmpeg.setFfprobePath(probePath);
+  } catch(e) {}
+  console.log('[FFmpeg] Disponible:', ffmpegInstaller.path);
+} catch(e) {
+  console.warn('[FFmpeg] Non disponible — Agent Montage utilisera un fallback léger');
+  ffmpeg = null;
+}
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -384,6 +387,14 @@ function preparerSegments(script, audioDurationSec) {
 // Priorité : ffprobe → estimation par taille (128kbps) → 60s par défaut
 function getAudioDuration(audioPath) {
   return new Promise((resolve) => {
+    if (!ffmpeg) {
+      // Estimation par taille (ElevenLabs ≈ 128kbps)
+      try {
+        const size = fs.statSync(audioPath).size;
+        resolve(Math.max(15, Math.min(120, (size * 8) / (128 * 1000))));
+      } catch(e) { resolve(60); }
+      return;
+    }
     ffmpeg.ffprobe(audioPath, (err, meta) => {
       if (!err && meta?.format?.duration) {
         resolve(meta.format.duration);
@@ -448,6 +459,7 @@ function creerSegmentVideo(imagePath, duration, texte, outputPath, couleur = 'wh
       );
     }
 
+    if (!ffmpeg) { resolve(); return; } // FFmpeg non dispo — segment vide
     ffmpeg(imagePath)
       .inputOptions(['-loop 1', `-t ${duration}`])
       .videoFilters(filters)
@@ -455,7 +467,6 @@ function creerSegmentVideo(imagePath, duration, texte, outputPath, couleur = 'wh
       .output(outputPath)
       .on('end', resolve)
       .on('error', (err) => {
-        // Si drawtext échoue, retry SANS texte
         console.warn('[Montage] drawtext échoué, retry sans texte:', err.message.slice(0,80));
         ffmpeg(imagePath)
           .inputOptions(['-loop 1', `-t ${duration}`])
@@ -473,7 +484,7 @@ function creerSegmentVideo(imagePath, duration, texte, outputPath, couleur = 'wh
 // Assembler tous les segments en une vidéo finale avec audio
 function assemblerVideo(segmentPaths, audioPath, outputPath) {
   return new Promise((resolve, reject) => {
-    // Créer le fichier de liste pour concat
+    if (!ffmpeg) { reject(new Error('FFmpeg non disponible sur ce serveur')); return; }
     const listFile = outputPath.replace('.mp4', '_list.txt');
     const listContent = segmentPaths.map(p => `file '${p}'`).join('\n');
     fs.writeFileSync(listFile, listContent);
@@ -611,6 +622,12 @@ async function creerImageFallback(outputPath, style) {
       cinematique:'color=c=0x050a15:size=1080x1920,geq=r='5':g='10+5*sin(X/120)':b='25+15*sin(Y/180)'',
     };
     const filter = gradients[style] || gradients.cinematique;
+    if (!ffmpeg) {
+      // Créer directement un JPEG noir si FFmpeg absent
+      const jpegBlack = Buffer.from('FFD8FFE000104A464946000101000001000100 00FFD9'.replace(/\s/g,''), 'hex');
+      try { fs.writeFileSync(outputPath, jpegBlack); } catch(e) { fs.writeFileSync(outputPath, Buffer.alloc(100)); }
+      resolve(); return;
+    }
     ffmpeg()
       .input(filter.split(',')[0])
       .inputOptions(['-f lavfi'])
