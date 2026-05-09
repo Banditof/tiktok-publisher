@@ -642,22 +642,17 @@ async function genererImagePollinations(prompt, outputPath, segIndex) {
   return false;
 }
 
-// Fonction principale : Pexels → HuggingFace → Pollinations → Fallback FFmpeg
+// Fonction principale : HuggingFace IA → Pollinations → Fallback FFmpeg
 async function downloadImagePollinations(prompt, outputPath, segIndex, totalSeg) {
-  // 1. Pexels (ta clé existante — fiable, rapide, images pertinentes)
-  if (STATE.creds.pexels) {
-    const ok = await genererImagePexels(prompt, outputPath);
-    if (ok) { log('montage', 'Image ' + (segIndex+1) + '/' + totalSeg + ' via Pexels ✅'); return true; }
-  }
-  // 2. HuggingFace IA (si clé disponible)
+  // 1. HuggingFace IA (images cohérentes avec la narration)
   if (STATE.creds.huggingface) {
     const ok = await genererImageHuggingFace(prompt, outputPath);
     if (ok) { log('montage', 'Image ' + (segIndex+1) + '/' + totalSeg + ' via HuggingFace IA ✅'); return true; }
   }
-  // 3. Pollinations.ai (gratuit, sans clé)
-  const ok3 = await genererImagePollinations(prompt, outputPath, segIndex);
-  if (ok3) { log('montage', 'Image ' + (segIndex+1) + '/' + totalSeg + ' via Pollinations ✅'); return true; }
-  // 4. Fallback FFmpeg (image colorée — toujours disponible)
+  // 2. Pollinations.ai (gratuit, sans clé)
+  const ok2 = await genererImagePollinations(prompt, outputPath, segIndex);
+  if (ok2) { log('montage', 'Image ' + (segIndex+1) + '/' + totalSeg + ' via Pollinations ✅'); return true; }
+  // 3. Fallback FFmpeg (image colorée — toujours disponible)
   log('montage', 'Image ' + (segIndex+1) + '/' + totalSeg + ' → fallback couleur', 'warn');
   await creerImageFallback(outputPath, segIndex);
   return false;
