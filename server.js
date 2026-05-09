@@ -532,25 +532,85 @@ function getVoiceSettings(ton) {
 //  AGENT MONTAGE — 1 image par 5s, cohérente avec la narration
 // ════════════════════════════════════════════════════════════════
 
-// Couleurs de fond selon le segment (variation visuelle même sans Pollinations)
+// Couleurs de fond selon le segment
 const FALLBACK_COLORS = [
-  '0x0a0520', '0x05102a', '0x150510', '0x0a1505', '0x1a0a05',
-  '0x050a1a', '0x0f0520', '0x05150a', '0x200505', '0x051020',
-  '0x0a2005', '0x150a20', '0x201505', '0x05200a',
+  '0x0a0520','0x05102a','0x150510','0x0a1505','0x1a0a05',
+  '0x050a1a','0x0f0520','0x05150a','0x200505','0x051020',
+  '0x0a2005','0x150a20','0x201505','0x05200a',
 ];
 
-async function downloadImagePollinations(prompt, outputPath, segIndex, totalSeg) {
-  if (!fetch) { await creerImageFallback(outputPath, segIndex); return false; }
+// ── Pexels : recherche d'image portrait selon les mots-clés du segment ──
+// Extrait les mots-clés pertinents du prompt pour la recherche Pexels
+function extraireMocsCles(prompt) {
+  // Mots à ignorer (stop words)
+  const stopWords = new Set(['the','a','an','and','or','but','in','on','at','to','for','of','with','by','from','up','into','during','including','this','that','these','those','is','are','was','were','be','been','being','have','has','had','do','does','did','will','would','could','should','may','might','must','shall']);
+  const mots = (prompt || '').toLowerCase()
+    .replace(/[^a-zA-Z\s]/g, ' ')
+    .split(/\s+/)
+    .filter(m => m.length > 3 && !stopWords.has(m));
+  return mots.slice(0, 3).join(' ') || 'dramatic scene';
+}
 
-  const styleExtra = 'cinematic vertical 9:16, ultra realistic, high quality, dramatic lighting, no human faces, atmospheric';
-  const fullPrompt = (prompt + ', ' + styleExtra).slice(0, 300);
-  const encoded    = encodeURIComponent(fullPrompt);
+async function genererImagePexels(prompt, outputPath) {
+  if (!fetch || !STATE.creds.pexels) return false;
+  const query   = extraireMocsCles(prompt);
+  const url     = 'https://api.pexels.com/v1/search?query=' + encodeURIComponent(query) + '&per_page=5&orientation=portrait';
+  try {
+    const res = await fetch(url, {
+      headers: { 'Authorization': STATE.creds.pexels },
+      timeout: 10000,
+    });
+    if (!res.ok) { console.warn('[Pexels] HTTP ' + res.status); return false; }
+    const data   = await res.json();
+    const photos = data.photos || [];
+    if (!photos.length) {
+      // Retry avec un mot-clé plus générique
+      const res2 = await fetch('https://api.pexels.com/v1/search?query=dramatic+scene&per_page=5&orientation=portrait', {
+        headers: { 'Authorization': STATE.creds.pexels }, timeout: 10000,
+      });
+      if (!res2.ok) return false;
+      const data2 = await res2.json();
+      photos.push(...(data2.photos || []));
+    }
+    if (!photos.length) return false;
+    // Choisir une photo aléatoire parmi les résultats
+    const photo   = photos[Math.floor(Math.random() * photos.length)];
+    const imgUrl  = photo.src.large2x || photo.src.large || photo.src.original;
+    const imgRes  = await fetch(imgUrl, { timeout: 15000 });
+    if (!imgRes.ok) return false;
+    const buf = await imgRes.buffer();
+    if (buf.length > 10000) { fs.writeFileSync(outputPath, buf); return true; }
+  } catch(e) {
+    console.warn('[Pexels] Erreur:', e.message.slice(0, 60));
+  }
+  return false;
+}
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const seed = Math.floor(Math.random() * 99999) + (segIndex * 1000);
-    const url  = 'https://image.pollinations.ai/prompt/' + encoded + '?width=1080&height=1920&seed=' + seed + '&nologo=true';
+// Modèles HuggingFace gratuits (par ordre de préférence)
+const HF_MODELS = [
+  'stabilityai/stable-diffusion-xl-base-1.0',
+  'runwayml/stable-diffusion-v1-5',
+  'CompVis/stable-diffusion-v1-4',
+];
+
+async function genererImageHuggingFace(prompt, outputPath) {
+  if (!fetch || !STATE.creds.huggingface) return false;
+  const fullPrompt = (prompt + ', cinematic vertical 9:16, ultra detailed, dramatic lighting, no humans').slice(0, 300);
+  for (const model of HF_MODELS) {
     try {
-      const res = await fetch(url, { timeout: 20000 });
+      const res = await fetch('https://api-inference.huggingface.co/models/' + model, {
+        method: 'POST',
+        headers: {
+          'Authorization': 'Bearer ' + STATE.creds.huggingface,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          inputs: fullPrompt,
+          parameters: { width: 512, height: 896, num_inference_steps: 20, guidance_scale: 7.5 },
+          options: { wait_for_model: true },
+        }),
+        timeout: 60000,
+      });
       if (res.ok) {
         const buf = await res.buffer();
         if (buf.length > 5000) {
@@ -558,14 +618,51 @@ async function downloadImagePollinations(prompt, outputPath, segIndex, totalSeg)
           return true;
         }
       }
+      // Si modèle en cours de chargement (503), attendre et réessayer
+      if (res.status === 503) { await sleep(10000); }
     } catch(e) {
-      if (attempt < 1) await sleep(1500);
+      console.warn('[HF] ' + model + ':', e.message.slice(0,60));
     }
   }
-  // Pollinations indisponible — créer une vraie image via FFmpeg
+  return false;
+}
+
+async function genererImagePollinations(prompt, outputPath, segIndex) {
+  if (!fetch) return false;
+  const enc  = encodeURIComponent((prompt + ', cinematic 9:16, atmospheric, dramatic').slice(0,250));
+  const seed = Math.floor(Math.random() * 99999) + (segIndex * 1000);
+  const url  = 'https://image.pollinations.ai/prompt/' + enc + '?width=1080&height=1920&seed=' + seed + '&nologo=true';
+  try {
+    const res = await fetch(url, { timeout: 20000 });
+    if (res.ok) {
+      const buf = await res.buffer();
+      if (buf.length > 5000) { fs.writeFileSync(outputPath, buf); return true; }
+    }
+  } catch(e) {}
+  return false;
+}
+
+// Fonction principale : Pexels → HuggingFace → Pollinations → Fallback FFmpeg
+async function downloadImagePollinations(prompt, outputPath, segIndex, totalSeg) {
+  // 1. Pexels (ta clé existante — fiable, rapide, images pertinentes)
+  if (STATE.creds.pexels) {
+    const ok = await genererImagePexels(prompt, outputPath);
+    if (ok) { log('montage', 'Image ' + (segIndex+1) + '/' + totalSeg + ' via Pexels ✅'); return true; }
+  }
+  // 2. HuggingFace IA (si clé disponible)
+  if (STATE.creds.huggingface) {
+    const ok = await genererImageHuggingFace(prompt, outputPath);
+    if (ok) { log('montage', 'Image ' + (segIndex+1) + '/' + totalSeg + ' via HuggingFace IA ✅'); return true; }
+  }
+  // 3. Pollinations.ai (gratuit, sans clé)
+  const ok3 = await genererImagePollinations(prompt, outputPath, segIndex);
+  if (ok3) { log('montage', 'Image ' + (segIndex+1) + '/' + totalSeg + ' via Pollinations ✅'); return true; }
+  // 4. Fallback FFmpeg (image colorée — toujours disponible)
+  log('montage', 'Image ' + (segIndex+1) + '/' + totalSeg + ' → fallback couleur', 'warn');
   await creerImageFallback(outputPath, segIndex);
   return false;
 }
+
 
 // Fallback : image colorée générée par FFmpeg (vraie image, pas un buffer fake)
 function creerImageFallback(outputPath, segIndex) {
@@ -958,7 +1055,9 @@ app.get('/dashboard', (req, res) => res.json({
 }));
 
 app.post('/configure', (req, res) => {
-  const { token, anthropic_key, elevenlabs_key, voice_id } = req.body;
+  const { token, anthropic_key, elevenlabs_key, voice_id, huggingface_key, pexels_key } = req.body;
+  if (huggingface_key) { STATE.creds.huggingface = huggingface_key; log('system', 'Clé HuggingFace configurée', 'success'); }
+  if (pexels_key)      { STATE.creds.pexels      = pexels_key;      log('system', 'Clé Pexels configurée', 'success'); }
   if (token)          { STATE.creds.tiktok      = token;          log('system', 'Token TikTok configuré', 'success'); }
   if (anthropic_key)  { STATE.creds.anthropic   = anthropic_key;  log('system', 'Clé Anthropic configurée', 'success'); }
   if (elevenlabs_key) { STATE.creds.elevenlabs  = elevenlabs_key; log('system', 'Clé ElevenLabs configurée', 'success'); }
