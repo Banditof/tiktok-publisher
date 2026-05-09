@@ -591,22 +591,33 @@ function getAudioDuration(audioPath) {
 function creerSegmentVideoFFmpeg(imgPath, duration, outputPath) {
   return new Promise((resolve, reject) => {
     if (!ffmpeg) { reject(new Error('FFmpeg non disponible')); return; }
+    // Pas de zoompan — trop instable sur Railway. Scale + crop simple et fiable.
     ffmpeg(imgPath)
       .inputOptions(['-loop 1', '-t ' + duration])
       .videoFilters([
         'scale=1080:1920:force_original_aspect_ratio=increase',
-        'crop=1080:1920',
-        'zoompan=z=\'min(zoom+0.0015,1.05)\':d=' + Math.round(duration * 30) + ':x=\'iw/2-(iw/zoom/2)\':y=\'ih/2-(ih/zoom/2)\':s=1080x1920',
+        'crop=1080:1920:0:0',
       ])
-      .outputOptions(['-c:v libx264', '-preset ultrafast', '-pix_fmt yuv420p', '-t ' + duration, '-r 30'])
+      .outputOptions([
+        '-c:v libx264', '-preset ultrafast', '-tune stillimage',
+        '-pix_fmt yuv420p', '-t ' + duration, '-r 25',
+      ])
       .output(outputPath)
       .on('end', resolve)
-      .on('error', () => {
-        // Retry sans zoompan si ça plante
-        ffmpeg(imgPath).inputOptions(['-loop 1', '-t ' + duration])
-          .videoFilters(['scale=1080:1920:force_original_aspect_ratio=increase', 'crop=1080:1920'])
-          .outputOptions(['-c:v libx264', '-preset ultrafast', '-pix_fmt yuv420p', '-t ' + duration, '-r 30'])
-          .output(outputPath).on('end', resolve).on('error', reject).run();
+      .on('error', function(err) {
+        console.warn('[Montage] Segment retry:', err.message.slice(0,60));
+        // Retry avec paramètres encore plus simples
+        ffmpeg(imgPath)
+          .inputOptions(['-loop 1', '-t ' + duration])
+          .outputOptions([
+            '-vf', 'scale=1080:1920',
+            '-c:v libx264', '-preset ultrafast', '-pix_fmt yuv420p',
+            '-t ' + duration, '-r 25',
+          ])
+          .output(outputPath)
+          .on('end', resolve)
+          .on('error', reject)
+          .run();
       })
       .run();
   });
@@ -620,7 +631,10 @@ function assemblerVideoFinale(segmentPaths, audioPath, outputPath, segments) {
     ffmpeg()
       .input(listFile).inputOptions(['-f concat', '-safe 0'])
       .input(audioPath)
-      .outputOptions(['-c:v copy', '-c:a aac', '-b:a 192k', '-shortest', '-movflags +faststart'])
+      .outputOptions([
+        '-c:v libx264', '-preset ultrafast', '-pix_fmt yuv420p',
+        '-c:a aac', '-b:a 128k', '-shortest', '-movflags +faststart',
+      ])
       .output(outputPath)
       .on('end', () => { try { fs.unlinkSync(listFile); } catch(e) {} resolve(); })
       .on('error', reject)
@@ -662,7 +676,9 @@ async function runMontage() {
 
       // Utiliser les segments du script (déjà découpés en 5s avec image_prompt)
       const segments = script.segments;
-      const durParSeg = audioDuration / segments.length;
+      // Chaque segment = 5s fixes, sauf le dernier qui prend le reste
+      const DUR_SEG = 5;
+      const durParSeg = DUR_SEG; // 5 secondes par image
 
       log('montage', 'Génération ' + segments.length + ' images IA contextuelles (Pollinations.ai)...');
 
@@ -700,8 +716,13 @@ async function runMontage() {
       const segPaths = [];
       for (let i = 0; i < segments.length; i++) {
         const sp = path.join('/tmp/segments', script.id + '_seg' + i + '.mp4');
-        await creerSegmentVideoFFmpeg(imagePaths[i], durParSeg, sp);
+        // Dernier segment : durée restante pour correspondre exactement à l'audio
+        const segDur = (i === segments.length - 1)
+          ? Math.max(3, audioDuration - (segments.length - 1) * DUR_SEG)
+          : DUR_SEG;
+        await creerSegmentVideoFFmpeg(imagePaths[i], segDur, sp);
         segPaths.push(sp);
+        log('montage', 'Segment ' + (i+1) + '/' + segments.length + ' encodé (' + segDur.toFixed(1) + 's)');
       }
 
       // Assembler avec la voix-off
