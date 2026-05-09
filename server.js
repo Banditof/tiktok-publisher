@@ -599,8 +599,7 @@ function creerSegmentVideoFFmpeg(imgPath, duration, outputPath) {
         'crop=1080:1920:0:0',
       ])
       .outputOptions([
-        '-c:v libx264', '-preset ultrafast', '-tune stillimage',
-        '-pix_fmt yuv420p', '-t ' + duration, '-r 25',
+        '-c:v libx264', '-preset ultrafast', '-pix_fmt yuv420p', '-t ' + duration, '-r 25',
       ])
       .output(outputPath)
       .on('end', resolve)
@@ -632,7 +631,7 @@ function assemblerVideoFinale(segmentPaths, audioPath, outputPath, segments) {
       .input(listFile).inputOptions(['-f concat', '-safe 0'])
       .input(audioPath)
       .outputOptions([
-        '-c:v libx264', '-preset ultrafast', '-pix_fmt yuv420p',
+        '-c:v copy',
         '-c:a aac', '-b:a 128k', '-shortest', '-movflags +faststart',
       ])
       .output(outputPath)
@@ -716,13 +715,11 @@ async function runMontage() {
       const segPaths = [];
       for (let i = 0; i < segments.length; i++) {
         const sp = path.join('/tmp/segments', script.id + '_seg' + i + '.mp4');
-        // Dernier segment : durée restante pour correspondre exactement à l'audio
-        const segDur = (i === segments.length - 1)
-          ? Math.max(3, audioDuration - (segments.length - 1) * DUR_SEG)
-          : DUR_SEG;
-        await creerSegmentVideoFFmpeg(imagePaths[i], segDur, sp);
+        // Tous les segments = 5s fixes. L'assemblage utilise -shortest
+        // pour s'arrêter quand l'audio se termine.
+        await creerSegmentVideoFFmpeg(imagePaths[i], DUR_SEG, sp);
         segPaths.push(sp);
-        log('montage', 'Segment ' + (i+1) + '/' + segments.length + ' encodé (' + segDur.toFixed(1) + 's)');
+        log('montage', 'Segment ' + (i+1) + '/' + segments.length + ' encodé (5s)');
       }
 
       // Assembler avec la voix-off
@@ -929,7 +926,7 @@ app.get('/progress', (req, res) => {
   res.json({ steps, currentAgent: current, doneCount: done, total: steps.length, pct: Math.round(done / steps.length * 100) });
 });
 
-app.post('/video/:f/approve', (req, res) => {
+app.post('/approve/:f', (req, res) => {
   const v = STATE.publishQueue[req.params.f];
   if (!v) return res.status(404).json({ error: 'Introuvable' });
   v.status = 'scheduled'; v.approvedAt = new Date().toISOString();
@@ -937,7 +934,7 @@ app.post('/video/:f/approve', (req, res) => {
   res.json({ ok: true, scheduledAt: v.scheduledAt });
 });
 
-app.post('/video/:f/reject', async (req, res) => {
+app.post('/reject/:f', async (req, res) => {
   const v = STATE.publishQueue[req.params.f];
   if (!v) return res.status(404).json({ error: 'Introuvable' });
   const titre = v.titre;
