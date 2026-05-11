@@ -24,9 +24,78 @@ try {
   console.log('[OK] FFmpeg disponible');
 } catch(e) { ffmpeg = null; console.warn('[WARN] FFmpeg non disponible — montage limité'); }
 
-['/tmp/audio','/tmp/images','/tmp/videos','/tmp/segments','/tmp/uploads'].forEach(d => {
+['/tmp/audio','/tmp/images','/tmp/videos','/tmp/segments','/tmp/uploads','/tmp/tiktok'].forEach(d => {
   try { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); } catch(e) {}
 });
+
+// ── Persistance état (survit aux redémarrages Railway) ──────────
+const STATE_FILE = '/tmp/tiktok/state.json';
+
+function sauvegarderEtat() {
+  try {
+    const toSave = {
+      creds:        STATE.creds,
+      apprentissage:STATE.apprentissage,
+      sujets:       STATE.sujets,
+      scripts:      STATE.scripts,
+      audioFiles:   STATE.audioFiles,
+      videoFiles:   STATE.videoFiles,
+      publishQueue: STATE.publishQueue,
+      strategy:     STATE.strategy,
+      savedAt:      new Date().toISOString(),
+    };
+    fs.writeFileSync(STATE_FILE, JSON.stringify(toSave, null, 2));
+  } catch(e) { console.warn('[State] Sauvegarde échouée:', e.message); }
+}
+
+function chargerEtat() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) return;
+    const saved = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    // Restaurer seulement ce qui est encore valide
+    if (saved.creds)         Object.assign(STATE.creds, saved.creds);
+    if (saved.apprentissage) Object.assign(STATE.apprentissage, saved.apprentissage);
+    if (saved.sujets)        STATE.sujets       = saved.sujets;
+    if (saved.scripts) {
+      // Vérifier que les fichiers audio existent encore
+      STATE.scripts = saved.scripts.map(s => {
+        if (s.audioFile && !fs.existsSync(path.join('/tmp/audio', s.audioFile))) {
+          s.status = s.status === 'audio_ready' ? 'ready' : s.status;
+          s.audioFile = null;
+        }
+        if (s.videoFile && !fs.existsSync(path.join('/tmp/videos', s.videoFile))) {
+          s.status = s.status === 'video_ready' ? 'audio_ready' : s.status;
+          s.videoFile = null;
+        }
+        return s;
+      });
+    }
+    if (saved.audioFiles) {
+      STATE.audioFiles = saved.audioFiles.filter(a =>
+        fs.existsSync(path.join('/tmp/audio', a.filename))
+      );
+    }
+    if (saved.videoFiles) {
+      STATE.videoFiles = saved.videoFiles.filter(v =>
+        fs.existsSync(path.join('/tmp/videos', v.filename))
+      );
+    }
+    if (saved.publishQueue) {
+      Object.keys(saved.publishQueue).forEach(fn => {
+        const v = saved.publishQueue[fn];
+        if (!v.filePath || fs.existsSync(v.filePath)) {
+          STATE.publishQueue[fn] = v;
+        }
+      });
+    }
+    const scriptCount = STATE.scripts.length;
+    const audioCount  = STATE.audioFiles.length;
+    console.log(`[State] Restauré: ${scriptCount} scripts, ${audioCount} audios`);
+    log('system', `État restauré: ${scriptCount} scripts, ${audioCount} audios`, 'success');
+  } catch(e) {
+    console.warn('[State] Restauration échouée:', e.message);
+  }
+}
 
 // ════════════════════════════════════════════════════════════════
 //  ÉTAT GLOBAL — mémoire des agents (apprentissage)
@@ -67,6 +136,7 @@ const STATE = {
 
   messageBus: [], alerts: [], actionLog: [],
   pipelinePaused: false,
+  emergencyStop: false,
 };
 
 // Voix ElevenLabs disponibles avec profils
@@ -290,6 +360,7 @@ JSON UNIQUEMENT:
 
     STATE.agents.veille.cycleCount = (STATE.agents.veille.cycleCount || 0) + 1;
     setAgent('veille', 'idle', { lastRun: new Date().toISOString() });
+    sauvegarderEtat();
   } catch(e) {
     log('veille', 'Erreur: ' + e.message, 'error');
     setAgent('veille', 'error');
@@ -385,6 +456,7 @@ JSON UNIQUEMENT:
 
   STATE.agents.script.cycleCount = (STATE.agents.script.cycleCount || 0) + 1;
   setAgent('script', 'idle', { lastRun: new Date().toISOString() });
+  sauvegarderEtat();
 }
 
 
@@ -480,6 +552,7 @@ async function runVoix() {
 
   STATE.agents.voix.cycleCount = (STATE.agents.voix.cycleCount || 0) + 1;
   setAgent('voix', 'idle', { lastRun: new Date().toISOString() });
+  sauvegarderEtat();
 }
 
 function choisirVoix(ton, genre, conseil) {
@@ -925,6 +998,7 @@ async function runMontage() {
 
   STATE.agents.montage.cycleCount = (STATE.agents.montage.cycleCount || 0) + 1;
   setAgent('montage', 'idle', { lastRun: new Date().toISOString() });
+  sauvegarderEtat();
 }
 
 
@@ -1141,6 +1215,37 @@ app.get('/videos/list', (req, res) => {
 });
 
 app.get('/sujets',   (req, res) => res.json({ sujets: STATE.sujets }));
+
+// ── Téléchargement scripts et audios ──────────────────────────────
+app.get('/download/script/:id', (req, res) => {
+  const script = STATE.scripts.find(s => s.id === req.params.id);
+  if (!script) return res.status(404).json({ error: 'Script introuvable' });
+  const lines = [
+    '# ' + (script.titre||''),
+    'Niche: ' + (script.niche||'—'),
+    'Ton: ' + (script.ton_narrateur||'—'),
+    'Voix: ' + (script.genre_voix||'—'),
+    'Hashtags: ' + (script.hashtags||[]).join(', '),
+    '',
+  ];
+  (script.segments||[]).forEach(function(seg, i) {
+    lines.push('--- Segment ' + (i+1) + ' ---');
+    lines.push('Narration: ' + (seg.narration||''));
+    lines.push('Image: ' + (seg.image_prompt||''));
+    lines.push('');
+  });
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="script_' + script.id + '.txt"');
+  res.send(lines.join('\n'));
+});
+
+app.get('/download/audio/:filename', (req, res) => {
+  const fp = path.join('/tmp/audio', req.params.filename.replace(/\.\./g, ''));
+  if (!fs.existsSync(fp)) return res.status(404).json({ error: 'Audio introuvable' });
+  res.setHeader('Content-Type', 'audio/mpeg');
+  res.setHeader('Content-Disposition', 'attachment; filename="' + req.params.filename + '"');
+  fs.createReadStream(fp).pipe(res);
+});
 app.get('/scripts',  (req, res) => res.json({ scripts: STATE.scripts }));
 app.get('/status',   (req, res) => res.json({ ok: true, queue: STATE.publishQueue, token_set: !!STATE.creds.tiktok }));
 app.get('/alerts',   (req, res) => res.json({ alerts: STATE.alerts }));
@@ -1157,6 +1262,32 @@ app.post('/run/:agent', async (req, res) => {
   else if (agent === 'montage')   await runMontage();
   else if (agent === 'pub')       runPub();
   else if (agent === 'all')       await runOrchestrator();
+});
+
+// ── ARRÊT D'URGENCE ──────────────────────────────────────────────
+app.post('/emergency-stop', (req, res) => {
+  STATE.emergencyStop = true;
+  STATE.pipelinePaused = true;
+  log('system', '🛑 ARRET URGENCE - tous les agents vont s arreter', 'error');
+  addAlert('api_limit', '🛑 Arret urgence actif - pipeline stoppe. Cliquer Reprendre pour relancer.', 'system');
+  res.json({ ok: true, stopped: true });
+});
+
+app.post('/emergency-resume', (req, res) => {
+  STATE.emergencyStop = false;
+  STATE.pipelinePaused = false;
+  log('system', 'Pipeline repris', 'info');
+  res.json({ ok: true, stopped: false });
+});
+
+app.get('/pipeline/status', (req, res) => {
+  res.json({
+    paused: !!STATE.pipelinePaused,
+    emergencyStop: !!STATE.emergencyStop,
+    runningAgents: Object.entries(STATE.agents)
+      .filter(([,a]) => a.status === 'running')
+      .map(([k]) => k),
+  });
 });
 
 // ── TEST MONTAGE : tester un script+audio spécifique ─────────────
@@ -1192,7 +1323,7 @@ app.post('/test/montage/:scriptId', async (req, res) => {
     script.videoFile = null;
   }
   script.status = 'audio_ready';
-  log('montage', 'Test montage déclenché pour: "' + script.titre + '"', 'info');
+  log('montage', 'Test montage declenche pour: ' + script.titre, 'info');
   try { await runMontage(); } catch(e) { log('montage', 'Erreur test: ' + e.message, 'error'); }
 });
 
@@ -1233,6 +1364,9 @@ if (upload2) {
 // ════════════════════════════════════════════════════════════════
 //  DÉMARRAGE
 // ════════════════════════════════════════════════════════════════
+// Charger l'état persisté au démarrage
+chargerEtat();
+
 app.listen(PORT, () => {
   console.log('\n🤖 TikTok Agent Suite v4 — 6 Agents IA Autonomes');
   console.log('   Port:   ' + PORT);
