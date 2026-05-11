@@ -66,6 +66,7 @@ const STATE = {
   },
 
   messageBus: [], alerts: [], actionLog: [],
+  pipelinePaused: false,
 };
 
 // Voix ElevenLabs disponibles avec profils
@@ -328,7 +329,8 @@ GENRE VOIX RECOMMANDÉ: ${sujet.genre_voix}
 ${topFormats.length ? 'FORMATS QUI PERFORMENT: ' + topFormats.join(', ') : ''}
 
 CONTRAINTES:
-- Durée MINIMUM 60 secondes (monétisation TikTok obligatoire)
+- Durée MINIMUM 60 secondes = EXACTEMENT 12 segments de 5s (monétisation TikTok OBLIGATOIRE)
+- Si tu génères moins de 12 segments, la vidéo sera trop courte et non monétisable
 - Voix-off uniquement (aucune instruction pour montrer un visage)
 - Structure: accroche 5s + développement 45s + révélation 8s + CTA 2s = 60s min
 - CHAQUE PHRASE doit donner une INDICATION VISUELLE PRÉCISE pour générer une image
@@ -347,11 +349,14 @@ JSON UNIQUEMENT:
 
       if (!parsed.segments || !Array.isArray(parsed.segments)) throw new Error('Segments manquants');
 
-      // Vérifier durée min 60s
+      // Vérifier durée min 50s (12 segments × 5s idéal, 10 segments × 5s = 50s minimum)
       const dureeEstimee = parsed.segments.length * 5;
-      if (dureeEstimee < 60) {
-        log('script', `Script "${parsed.titre}" trop court (${dureeEstimee}s) — ignoré`, 'warn');
+      if (dureeEstimee < 50) {
+        log('script', `Script "${parsed.titre}" trop court (${dureeEstimee}s < 50s) — ignoré`, 'warn');
         continue;
+      }
+      if (dureeEstimee < 60) {
+        log('script', `Script "${parsed.titre}" accepté (${dureeEstimee}s — légèrement sous 60s)`, 'warn');
       }
 
       const script = {
@@ -624,6 +629,7 @@ async function genererImageHuggingFace(prompt, outputPath) {
       console.warn('[HF] ' + model + ':', e.message.slice(0,60));
     }
   }
+  console.warn('[HF] Tous les modèles ont échoué — clé invalide ou quota dépassé?');
   return false;
 }
 
@@ -648,6 +654,10 @@ async function downloadImagePollinations(prompt, outputPath, segIndex, totalSeg)
   if (STATE.creds.huggingface) {
     const ok = await genererImageHuggingFace(prompt, outputPath);
     if (ok) { log('montage', 'Image ' + (segIndex+1) + '/' + totalSeg + ' via HuggingFace IA ✅'); return true; }
+    log('montage', 'HuggingFace échec seg ' + (segIndex+1) + ' — essai Pollinations', 'warn');
+  } else if (segIndex === 0) {
+    log('montage', '⚠️ Clé HuggingFace non configurée — configure-la dans le Dashboard pour des images IA', 'warn');
+    addAlert('api_limit', 'Clé HuggingFace manquante — les images sont en mode fallback couleur. Ajoute ta clé HuggingFace gratuite dans le Dashboard (Configuration).', 'montage');
   }
   // 2. Pollinations.ai (gratuit, sans clé)
   const ok2 = await genererImagePollinations(prompt, outputPath, segIndex);
@@ -1147,6 +1157,62 @@ app.post('/run/:agent', async (req, res) => {
   else if (agent === 'montage')   await runMontage();
   else if (agent === 'pub')       runPub();
   else if (agent === 'all')       await runOrchestrator();
+});
+
+// ── TEST MONTAGE : tester un script+audio spécifique ─────────────
+app.get('/test/scripts', (req, res) => {
+  // Retourner les scripts avec audio prêt
+  const scripts = STATE.scripts
+    .filter(s => s.audioFile && fs.existsSync(path.join('/tmp/audio', s.audioFile)))
+    .map(s => ({
+      id: s.id, titre: s.titre, status: s.status,
+      audioFile: s.audioFile, segments: (s.segments||[]).length,
+      audioDuration: s.audioDuration || 0,
+    }));
+  res.json({ scripts });
+});
+
+app.post('/test/montage/:scriptId', async (req, res) => {
+  const script = STATE.scripts.find(s => s.id === req.params.scriptId);
+  if (!script) return res.status(404).json({ error: 'Script introuvable' });
+  if (!script.audioFile) return res.status(400).json({ error: 'Pas de fichier audio pour ce script' });
+  const audioPath = path.join('/tmp/audio', script.audioFile);
+  if (!fs.existsSync(audioPath)) return res.status(400).json({ error: 'Fichier audio manquant sur le serveur' });
+
+  res.json({ ok: true, message: 'Test montage démarré pour "' + script.titre + '"' });
+
+  // Remettre le script en état audio_ready pour le traiter
+  script.status = 'audio_ready';
+  // Supprimer l'ancienne vidéo si elle existe
+  if (script.videoFile) {
+    const oldPath = path.join('/tmp/videos', script.videoFile);
+    try { if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath); } catch(e) {}
+    delete STATE.publishQueue[script.videoFile];
+    STATE.videoFiles = STATE.videoFiles.filter(v => v.filename !== script.videoFile);
+    script.videoFile = null;
+  }
+  script.status = 'audio_ready';
+  log('montage', 'Test montage déclenché pour: "' + script.titre + '"', 'info');
+  try { await runMontage(); } catch(e) { log('montage', 'Erreur test: ' + e.message, 'error'); }
+});
+
+// ── Contrôle pipeline : activer/désactiver pause entre étapes ──────
+app.post('/pipeline/pause', (req, res) => {
+  STATE.pipelinePaused = true;
+  log('system', 'Pipeline mis en pause — en attente de validation manuelle', 'warn');
+  res.json({ ok: true, paused: true });
+});
+app.post('/pipeline/resume', (req, res) => {
+  STATE.pipelinePaused = false;
+  log('system', 'Pipeline repris', 'info');
+  res.json({ ok: true, paused: false });
+});
+app.get('/pipeline/state', (req, res) => {
+  res.json({
+    paused: !!STATE.pipelinePaused,
+    scripts: STATE.scripts.map(s => ({ id:s.id, titre:s.titre, status:s.status, audioFile:s.audioFile||null, segments:(s.segments||[]).length })),
+    audios: STATE.audioFiles.map(a => ({ filename:a.filename, scriptId:a.scriptId, size:a.size, duration:a.duration, voixNom:a.voixNom })),
+  });
 });
 
 // Upload manuel depuis Robot #5
