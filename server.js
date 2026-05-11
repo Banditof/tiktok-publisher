@@ -345,10 +345,14 @@ JSON UNIQUEMENT:
 
     if (!parsed.sujets || !Array.isArray(parsed.sujets)) throw new Error('Format JSON invalide');
 
-    STATE.sujets = parsed.sujets.map(s => ({
+    // Marquer les anciens sujets 'proposed' comme abandonnés avant d'ajouter les nouveaux
+    STATE.sujets.forEach(s => { if (s.status === 'proposed') s.status = 'abandoned'; });
+    // Ajouter les nouveaux sujets
+    const newSujets = parsed.sujets.map(s => ({
       ...s, id: Date.now() + '_' + Math.random().toString(36).slice(2, 5),
       status: 'proposed', createdAt: new Date().toISOString(),
     }));
+    STATE.sujets = [...STATE.sujets.filter(s => s.status !== 'abandoned'), ...newSujets];
 
     const decision = `3 sujets proposés: ${parsed.sujets.map(s => s.titre + ' (' + s.potentiel_viral + '%)').join(' | ')}`;
     log('veille', 'Sujets sélectionnés', 'success', decision);
@@ -375,9 +379,9 @@ async function runScript() {
 
   const sujetsDispos = STATE.sujets.filter(s => s.status === 'proposed');
   if (!sujetsDispos.length) { log('script', 'Aucun sujet disponible — attente Agent Veille'); return; }
-  if (STATE.scripts.filter(s => ['ready', 'audio_pending', 'audio_ready'].includes(s.status)).length >= 3) {
-    log('script', 'Scripts suffisants en pipeline'); return;
-  }
+  // Ne pas bloquer si des anciens scripts existent — traiter TOUS les nouveaux sujets proposés
+  // Un sujet proposé doit TOUJOURS générer un script, même si le pipeline est plein
+  log('script', sujetsDispos.length + ' nouveaux sujets a scripter');
 
   setAgent('script', 'running');
   const sig = getMsgs('script', true); markRead('script');
@@ -475,7 +479,7 @@ async function runVoix() {
   setAgent('voix', 'running');
   const sig = getMsgs('voix', true); markRead('voix');
 
-  for (const script of scriptsReady.slice(0, 2)) {
+  for (const script of scriptsReady.slice(0, 3)) { // Traiter jusqu'a 3 scripts par cycle
     log('voix', 'Sélection de la voix optimale pour: "' + script.titre + '"');
     script.status = 'audio_pending';
 
@@ -708,16 +712,26 @@ async function genererImageHuggingFace(prompt, outputPath) {
 
 async function genererImagePollinations(prompt, outputPath, segIndex) {
   if (!fetch) return false;
-  const enc  = encodeURIComponent((prompt + ', cinematic 9:16, atmospheric, dramatic').slice(0,250));
+  // Essayer plusieurs variantes d'URL Pollinations
+  const promptClean = (prompt + ', cinematic, dramatic, no people').replace(/[^\w\s,.-]/g, ' ').trim().slice(0, 200);
   const seed = Math.floor(Math.random() * 99999) + (segIndex * 1000);
-  const url  = 'https://image.pollinations.ai/prompt/' + enc + '?width=1080&height=1920&seed=' + seed + '&nologo=true';
-  try {
-    const res = await fetch(url, { timeout: 20000 });
-    if (res.ok) {
-      const buf = await res.buffer();
-      if (buf.length > 5000) { fs.writeFileSync(outputPath, buf); return true; }
+  const urls = [
+    'https://image.pollinations.ai/prompt/' + encodeURIComponent(promptClean) + '?width=1080&height=1920&seed=' + seed + '&nologo=true&model=flux',
+    'https://image.pollinations.ai/prompt/' + encodeURIComponent(promptClean) + '?width=768&height=1344&seed=' + seed + '&nologo=true',
+    'https://pollinations.ai/p/' + encodeURIComponent(promptClean.slice(0,100)),
+  ];
+  for (const url of urls) {
+    try {
+      const res = await fetch(url, { timeout: 30000 });
+      if (res.ok) {
+        const buf = await res.buffer();
+        if (buf.length > 5000) { fs.writeFileSync(outputPath, buf); return true; }
+      }
+    } catch(e) {
+      console.warn('[Pollinations] ' + url.slice(0,60) + ':', e.message.slice(0,40));
     }
-  } catch(e) {}
+    await sleep(1000);
+  }
   return false;
 }
 
@@ -891,7 +905,7 @@ async function runMontage() {
   setAgent('montage', 'running');
   const sig = getMsgs('montage', true); markRead('montage');
 
-  for (const script of scriptsReady.slice(0, 1)) {
+  for (const script of scriptsReady.slice(0, 2)) { // 2 vidéos par cycle max
     log('montage', 'Montage de: "' + script.titre + '" — ' + script.segments.length + ' images à générer');
     script.status = 'video_pending';
 
